@@ -310,7 +310,10 @@ pub fn responses_to_chat_completions_with_reasoning(
         coalesce_replayed_tool_turn_messages(&mut messages);
     }
     backfill_tool_call_reasoning_placeholders(&mut messages);
-    let messages = collapse_system_messages_to_head(messages);
+    // MiniMax rejects a system message after the first one (2013). Everyone
+    // else keeps later developer/system messages where Codex put them.
+    // Folding those into messages[0] rewrites the prefix on the next turn.
+    let messages = collapse_system_messages_to_head(messages, requires_leading_system_only(model));
     result["messages"] = json!(messages);
 
     if let Some(max_tokens) = body.get("max_output_tokens") {
@@ -577,22 +580,38 @@ fn zen_effort_rank(effort: &str) -> Option<u8> {
 
 /// MiniMax 严格要求 messages 中只能首条出现 `role=system`，
 /// 否则返回 `invalid params, chat content has invalid message role: system (2013)`。
-/// 把所有 system 消息合并到首位，避免中间 system（如 Codex 的 `developer` 指令）触发该约束；
-/// 该重排对 OpenAI / DeepSeek 等宽松兼容层也是无损的。
-fn collapse_system_messages_to_head(messages: Vec<Value>) -> Vec<Value> {
+fn requires_leading_system_only(model: &str) -> bool {
+    let name = model
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    name.starts_with("minimax") || name.contains("minimax-")
+}
+
+/// 只合并开头连续的 system。对话开始之后的 system/developer 留在原位。
+/// `collapse_all` 为真时（MiniMax）才把后面的 system 也抽进第一条。
+/// 后追加的 developer 若拼进 messages[0]，精确前缀缓存会从系统提示词内部断开。
+fn collapse_system_messages_to_head(messages: Vec<Value>, collapse_all: bool) -> Vec<Value> {
     let mut system_chunks: Vec<String> = Vec::new();
     let mut rest: Vec<Value> = Vec::with_capacity(messages.len());
+    let mut passed_preamble = false;
 
     for msg in messages {
-        if msg.get("role").and_then(|v| v.as_str()) == Some("system") {
-            if let Some(text) = msg.get("content").and_then(|v| v.as_str()) {
-                let trimmed = text.trim();
-                if !trimmed.is_empty() {
+        if let Some(text) = msg
+            .get("role")
+            .and_then(|v| v.as_str())
+            .filter(|role| *role == "system")
+            .and_then(|_| msg.get("content").and_then(|v| v.as_str()))
+        {
+            if collapse_all || !passed_preamble {
+                if !text.trim().is_empty() {
                     system_chunks.push(text.to_string());
                 }
                 continue;
             }
         }
+        passed_preamble = true;
         rest.push(msg);
     }
 
@@ -988,8 +1007,9 @@ fn append_responses_item_as_chat_message(
         Some("additional_tools") => {}
         Some("input_text" | "input_image" | "input_file" | "input_audio") => {
             if let Some(system_message) = hoisted_system_message(item) {
-                // Hoisted to messages[0] by collapse_system_messages_to_head; do not
-                // flush pending tool media at its mid-stream position.
+                // Pushed here and left in place, unless the model requires every
+                // system message at messages[0]. Do not flush tool media at this
+                // mid-stream position.
                 flush_pending_tool_calls(
                     messages,
                     pending_tool_calls,
@@ -1042,7 +1062,8 @@ fn append_responses_item_as_chat_message(
         }
         Some("message") | None => {
             if let Some(system_message) = hoisted_system_message(item) {
-                // Hoisted to messages[0] by collapse_system_messages_to_head;
+                // Left at this position unless the model folds every system
+                // message into messages[0].
                 // keep surrounding parallel tool outputs and media contiguous.
                 flush_pending_tool_calls(
                     messages,
@@ -4059,6 +4080,37 @@ mod tests {
     }
 
     #[test]
+    fn responses_request_keeps_later_developer_message_in_place() {
+        let input = json!({
+            "model": "qwen-flash-next",
+            "instructions": "You are Codex.",
+            "input": [
+                {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "Permissions block"}]},
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "你好"}]},
+                {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "<codex_apps_client_time_context>Asia/Shanghai</codex_apps_client_time_context>"}]},
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "下一句"}]}
+            ]
+        });
+
+        let result = responses_to_chat_completions(input).unwrap();
+        let messages = result["messages"].as_array().unwrap();
+
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0]["role"], "system");
+        let head = messages[0]["content"].as_str().unwrap();
+        assert!(head.contains("You are Codex."));
+        assert!(head.contains("Permissions block"));
+        assert!(!head.contains("codex_apps_client_time_context"));
+        assert_eq!(messages[1]["role"], "user");
+        assert_eq!(messages[2]["role"], "system");
+        assert!(messages[2]["content"]
+            .as_str()
+            .unwrap()
+            .contains("codex_apps_client_time_context"));
+        assert_eq!(messages[3]["content"], "下一句");
+    }
+
+    #[test]
     fn additional_tools_carrier_is_lifted_not_converted_to_a_message() {
         // Shape from #7451: Codex 0.154+ ships extra tools in an
         // `additional_tools` input carrier (role `developer`, no `content`).
@@ -4188,14 +4240,22 @@ mod tests {
             json!({"role": "system", "content": "S2"}),
             json!({"role": "user", "content": "U2"}),
         ];
-        let out = collapse_system_messages_to_head(input);
+        let kept = collapse_system_messages_to_head(input.clone(), false);
+        assert_eq!(kept.len(), 5);
+        assert_eq!(kept[0]["content"], "S1");
+        assert_eq!(kept[1]["content"], "U1");
+        assert_eq!(kept[2]["content"], "A1");
+        assert_eq!(kept[3]["role"], "system");
+        assert_eq!(kept[3]["content"], "S2");
+        assert_eq!(kept[4]["content"], "U2");
 
-        assert_eq!(out.len(), 4);
-        assert_eq!(out[0]["role"], "system");
-        assert_eq!(out[0]["content"], "S1\n\nS2");
-        assert_eq!(out[1]["content"], "U1");
-        assert_eq!(out[2]["content"], "A1");
-        assert_eq!(out[3]["content"], "U2");
+        let collapsed = collapse_system_messages_to_head(input, true);
+        assert_eq!(collapsed.len(), 4);
+        assert_eq!(collapsed[0]["role"], "system");
+        assert_eq!(collapsed[0]["content"], "S1\n\nS2");
+        assert_eq!(collapsed[1]["content"], "U1");
+        assert_eq!(collapsed[2]["content"], "A1");
+        assert_eq!(collapsed[3]["content"], "U2");
     }
 
     #[test]
