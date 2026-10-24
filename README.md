@@ -30,7 +30,7 @@ let messages = collapse_system_messages_to_head(messages, requires_leading_syste
 - 遇到第一条非 system 之后，`passed_preamble = true`。之后的 system 留在原下标，不再抽走。时间块留在它出现的那一轮前面。
 - `collapse_all == true`（MiniMax）时，后面的 system 也抽进第一条。这是供应商开关，默认关。
 
-`append_responses_input_as_chat_messages` 里，还没收到结果的 tool_call 中间夹着的 developer 先放进 `deferred_systems`，等这批 tool 消息排完再放出。不拆 tool 批次，也不抽进 `messages[0]`。
+`append_responses_input_as_chat_messages` 里，还没收到结果的 tool_call 中间夹着的 developer 先放进 `deferred_systems`。tool 结果那条路径不放，所以批次中间不拆开。下一条 user / assistant，或者 input 收尾，即使还有 tool 一直没回结果，也把攒着的消息放出。留着不放会把这条消息丢掉。不抽进 `messages[0]`。
 
 测试 `responses_request_to_chat_merges_mid_stream_system_into_head`：出现在几条 user 之后的 developer（例如 `Collaboration Mode`）必须留在原下标。`messages[0]` 只含它之前的 system 文本。
 

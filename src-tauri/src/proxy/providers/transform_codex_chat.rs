@@ -728,13 +728,8 @@ fn append_responses_input_as_chat_messages(
         &mut pending_reasoning,
         &mut last_assistant_index,
     );
-    flush_deferred_systems_if_batch_closed(
-        messages,
-        &pending_tool_calls,
-        &pending_media,
-        &unanswered_tool_ids,
-        &mut deferred_systems,
-    );
+    // 输入收尾。没等到结果的 tool_call 也要放出攒着的 developer，否则这条消息被丢掉。
+    flush_deferred_systems(messages, &mut deferred_systems);
     // 整个 input 处理完毕后仍剩余的 pending reasoning 属于「真正的尾部」思考
     // （其后已没有任何可前向附挂的 message / function_call），回溯附挂到最后一条
     // assistant；目标已有 reasoning_content 时追加，以保留同一 turn 的 embedded
@@ -1063,13 +1058,7 @@ fn append_responses_item_as_chat_message(
             // there is no new assistant batch. A previous tool result may
             // still have media waiting, so flush it before this new message.
             flush_pending_chat_tool_media(messages, pending_media);
-            flush_deferred_systems_if_batch_closed(
-                messages,
-                pending_tool_calls,
-                pending_media,
-                unanswered_tool_ids,
-                deferred_systems,
-            );
+            flush_deferred_systems(messages, deferred_systems);
             let role = item
                 .get("role")
                 .and_then(|v| v.as_str())
@@ -1126,13 +1115,7 @@ fn append_responses_item_as_chat_message(
                     last_assistant_index,
                 );
                 flush_pending_chat_tool_media(messages, pending_media);
-                flush_deferred_systems_if_batch_closed(
-                    messages,
-                    pending_tool_calls,
-                    pending_media,
-                    unanswered_tool_ids,
-                    deferred_systems,
-                );
+                flush_deferred_systems(messages, deferred_systems);
                 let message = responses_message_item_to_chat_message(
                     item,
                     pending_reasoning,
@@ -1179,13 +1162,7 @@ fn append_responses_item_as_chat_message(
                     last_assistant_index,
                 );
                 flush_pending_chat_tool_media(messages, pending_media);
-                flush_deferred_systems_if_batch_closed(
-                    messages,
-                    pending_tool_calls,
-                    pending_media,
-                    unanswered_tool_ids,
-                    deferred_systems,
-                );
+                flush_deferred_systems(messages, deferred_systems);
                 let message = responses_message_item_to_chat_message(
                     item,
                     pending_reasoning,
@@ -1264,14 +1241,11 @@ fn hold_or_push_hoisted_system(
     }
 }
 
-fn flush_deferred_systems_if_batch_closed(
-    messages: &mut Vec<Value>,
-    pending_tool_calls: &[Value],
-    pending_media: &[Value],
-    unanswered: &HashSet<String>,
-    deferred: &mut Vec<Value>,
-) {
-    if !tool_batch_open(pending_tool_calls, pending_media, unanswered) {
+/// 在真回合边界或输入收尾放出攒着的 developer / system。
+/// 调用点都在 `flush_pending_tool_calls` 之后，tool 消息已经排完，这里不再看
+/// 还有没有未返回的 tool_call。留下不放会把这条消息整段丢掉，相邻 assistant 也会粘成一条。
+fn flush_deferred_systems(messages: &mut Vec<Value>, deferred: &mut Vec<Value>) {
+    if !deferred.is_empty() {
         messages.append(deferred);
     }
 }
@@ -2971,6 +2945,15 @@ mod tests {
                 .collect();
             assert_eq!(outputs.len(), 1);
             assert_eq!(outputs[0]["tool_call_id"], "call_next");
+            assert!(
+                messages.iter().any(|message| {
+                    message
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .is_some_and(|content| content.contains("New context."))
+                }),
+                "boundary message dropped: {messages:?}"
+            );
         }
     }
 
