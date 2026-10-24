@@ -659,6 +659,10 @@ fn append_responses_input_as_chat_messages(
     // 「tool message must be a response to a preceding message with tool_calls」
     // 而直接 400。
     let mut known_tool_call_ids: HashSet<String> = HashSet::new();
+    // 还没收到结果的 tool_call。夹在这批调用中间的 developer 先攒着，
+    // 等 tool 消息排完再放出，避免拆开 tool 批次，也不抽进 messages[0]。
+    let mut unanswered_tool_ids: HashSet<String> = HashSet::new();
+    let mut deferred_systems: Vec<Value> = Vec::new();
     // 落在并行工具结果中间的孤儿结果先暂存，等回合边界再降级输出，
     // 避免出现 `tool, user, tool` 这种仍会被严格上游拒绝的序列。
     let mut pending_orphan_results: Vec<Value> = Vec::new();
@@ -686,6 +690,8 @@ fn append_responses_input_as_chat_messages(
                     &mut pending_reasoning,
                     &mut last_assistant_index,
                     &mut known_tool_call_ids,
+                    &mut unanswered_tool_ids,
+                    &mut deferred_systems,
                     &mut pending_orphan_results,
                     tool_context,
                 )?;
@@ -700,6 +706,8 @@ fn append_responses_input_as_chat_messages(
                 &mut pending_reasoning,
                 &mut last_assistant_index,
                 &mut known_tool_call_ids,
+                &mut unanswered_tool_ids,
+                &mut deferred_systems,
                 &mut pending_orphan_results,
                 tool_context,
             )?;
@@ -719,6 +727,13 @@ fn append_responses_input_as_chat_messages(
         &mut pending_media,
         &mut pending_reasoning,
         &mut last_assistant_index,
+    );
+    flush_deferred_systems_if_batch_closed(
+        messages,
+        &pending_tool_calls,
+        &pending_media,
+        &unanswered_tool_ids,
+        &mut deferred_systems,
     );
     // 整个 input 处理完毕后仍剩余的 pending reasoning 属于「真正的尾部」思考
     // （其后已没有任何可前向附挂的 message / function_call），回溯附挂到最后一条
@@ -841,6 +856,8 @@ fn append_responses_item_as_chat_message(
     pending_reasoning: &mut Option<String>,
     last_assistant_index: &mut Option<usize>,
     known_tool_call_ids: &mut HashSet<String>,
+    unanswered_tool_ids: &mut HashSet<String>,
+    deferred_systems: &mut Vec<Value>,
     pending_orphan_results: &mut Vec<Value>,
     tool_context: &CodexToolContext,
 ) -> Result<(), ProxyError> {
@@ -851,6 +868,7 @@ fn append_responses_item_as_chat_message(
             let mut tool_call = responses_function_call_to_chat_tool_call(item, tool_context);
             copy_tool_call_extra_content(&mut tool_call, item);
             register_known_tool_call_id(known_tool_call_ids, &tool_call);
+            note_unanswered_tool_call(unanswered_tool_ids, &tool_call);
             pending_tool_calls.push(tool_call);
         }
         Some("custom_tool_call") => {
@@ -858,6 +876,7 @@ fn append_responses_item_as_chat_message(
             let mut tool_call = responses_custom_tool_call_to_chat_tool_call(item);
             copy_tool_call_extra_content(&mut tool_call, item);
             register_known_tool_call_id(known_tool_call_ids, &tool_call);
+            note_unanswered_tool_call(unanswered_tool_ids, &tool_call);
             pending_tool_calls.push(tool_call);
         }
         Some("tool_search_call") => {
@@ -865,6 +884,7 @@ fn append_responses_item_as_chat_message(
             let mut tool_call = responses_tool_search_call_to_chat_tool_call(item);
             copy_tool_call_extra_content(&mut tool_call, item);
             register_known_tool_call_id(known_tool_call_ids, &tool_call);
+            note_unanswered_tool_call(unanswered_tool_ids, &tool_call);
             pending_tool_calls.push(tool_call);
         }
         Some("function_call_output") => {
@@ -902,6 +922,7 @@ fn append_responses_item_as_chat_message(
                     None => String::new(),
                 }
             };
+            unanswered_tool_ids.remove(call_id);
             messages.push(json!({
                 "role": "tool",
                 "tool_call_id": call_id,
@@ -952,6 +973,7 @@ fn append_responses_item_as_chat_message(
                 // Preserve the legacy whole-item representation exactly.
                 canonical_json_string(item)
             };
+            unanswered_tool_ids.remove(call_id);
             messages.push(json!({
                 "role": "tool",
                 "tool_call_id": call_id,
@@ -979,6 +1001,8 @@ fn append_responses_item_as_chat_message(
                 pending_reasoning,
                 last_assistant_index,
                 known_tool_call_ids,
+                unanswered_tool_ids,
+                deferred_systems,
                 pending_orphan_results,
                 tool_context,
             )?;
@@ -993,6 +1017,8 @@ fn append_responses_item_as_chat_message(
                     pending_reasoning,
                     last_assistant_index,
                     known_tool_call_ids,
+                    unanswered_tool_ids,
+                    deferred_systems,
                     pending_orphan_results,
                     tool_context,
                 )?;
@@ -1007,9 +1033,8 @@ fn append_responses_item_as_chat_message(
         Some("additional_tools") => {}
         Some("input_text" | "input_image" | "input_file" | "input_audio") => {
             if let Some(system_message) = hoisted_system_message(item) {
-                // Pushed here and left in place, unless the model requires every
-                // system message at messages[0]. Do not flush tool media at this
-                // mid-stream position.
+                // 工具批次还没结束时先攒着。抽进 messages[0] 会改前缀，
+                // 立刻插入会把 tool 消息拆开。
                 flush_pending_tool_calls(
                     messages,
                     pending_tool_calls,
@@ -1017,7 +1042,14 @@ fn append_responses_item_as_chat_message(
                     pending_reasoning,
                     last_assistant_index,
                 );
-                messages.push(system_message);
+                hold_or_push_hoisted_system(
+                    system_message,
+                    messages,
+                    pending_tool_calls,
+                    pending_media,
+                    unanswered_tool_ids,
+                    deferred_systems,
+                );
                 return Ok(());
             }
             flush_pending_tool_calls(
@@ -1031,6 +1063,13 @@ fn append_responses_item_as_chat_message(
             // there is no new assistant batch. A previous tool result may
             // still have media waiting, so flush it before this new message.
             flush_pending_chat_tool_media(messages, pending_media);
+            flush_deferred_systems_if_batch_closed(
+                messages,
+                pending_tool_calls,
+                pending_media,
+                unanswered_tool_ids,
+                deferred_systems,
+            );
             let role = item
                 .get("role")
                 .and_then(|v| v.as_str())
@@ -1062,9 +1101,7 @@ fn append_responses_item_as_chat_message(
         }
         Some("message") | None => {
             if let Some(system_message) = hoisted_system_message(item) {
-                // Left at this position unless the model folds every system
-                // message into messages[0].
-                // keep surrounding parallel tool outputs and media contiguous.
+                // 工具批次还没结束时先攒着，排完 tool 和图片再放到批次后面。
                 flush_pending_tool_calls(
                     messages,
                     pending_tool_calls,
@@ -1072,7 +1109,14 @@ fn append_responses_item_as_chat_message(
                     pending_reasoning,
                     last_assistant_index,
                 );
-                messages.push(system_message);
+                hold_or_push_hoisted_system(
+                    system_message,
+                    messages,
+                    pending_tool_calls,
+                    pending_media,
+                    unanswered_tool_ids,
+                    deferred_systems,
+                );
             } else if item.get("role").is_some() || item.get("content").is_some() {
                 flush_pending_tool_calls(
                     messages,
@@ -1082,6 +1126,13 @@ fn append_responses_item_as_chat_message(
                     last_assistant_index,
                 );
                 flush_pending_chat_tool_media(messages, pending_media);
+                flush_deferred_systems_if_batch_closed(
+                    messages,
+                    pending_tool_calls,
+                    pending_media,
+                    unanswered_tool_ids,
+                    deferred_systems,
+                );
                 let message = responses_message_item_to_chat_message(
                     item,
                     pending_reasoning,
@@ -1111,7 +1162,14 @@ fn append_responses_item_as_chat_message(
                     pending_reasoning,
                     last_assistant_index,
                 );
-                messages.push(system_message);
+                hold_or_push_hoisted_system(
+                    system_message,
+                    messages,
+                    pending_tool_calls,
+                    pending_media,
+                    unanswered_tool_ids,
+                    deferred_systems,
+                );
             } else if item.get("role").is_some() || item.get("content").is_some() {
                 flush_pending_tool_calls(
                     messages,
@@ -1121,6 +1179,13 @@ fn append_responses_item_as_chat_message(
                     last_assistant_index,
                 );
                 flush_pending_chat_tool_media(messages, pending_media);
+                flush_deferred_systems_if_batch_closed(
+                    messages,
+                    pending_tool_calls,
+                    pending_media,
+                    unanswered_tool_ids,
+                    deferred_systems,
+                );
                 let message = responses_message_item_to_chat_message(
                     item,
                     pending_reasoning,
@@ -1164,6 +1229,51 @@ fn is_tool_result_item(item: &Value) -> bool {
         item.get("type").and_then(Value::as_str),
         Some("function_call_output" | "custom_tool_call_output" | "tool_search_output")
     )
+}
+
+fn note_unanswered_tool_call(unanswered: &mut HashSet<String>, tool_call: &Value) {
+    if let Some(id) = tool_call.get("id").and_then(Value::as_str) {
+        if !id.is_empty() {
+            unanswered.insert(id.to_string());
+        }
+    }
+}
+
+fn tool_batch_open(
+    pending_tool_calls: &[Value],
+    pending_media: &[Value],
+    unanswered: &HashSet<String>,
+) -> bool {
+    !pending_tool_calls.is_empty() || !unanswered.is_empty() || !pending_media.is_empty()
+}
+
+/// 工具调用还没收齐时，developer / system 先离开消息流。
+/// 收齐后再附在这批 tool 和图片后面，不并进 messages[0]。
+fn hold_or_push_hoisted_system(
+    system_message: Value,
+    messages: &mut Vec<Value>,
+    pending_tool_calls: &[Value],
+    pending_media: &[Value],
+    unanswered: &HashSet<String>,
+    deferred: &mut Vec<Value>,
+) {
+    if tool_batch_open(pending_tool_calls, pending_media, unanswered) {
+        deferred.push(system_message);
+    } else {
+        messages.push(system_message);
+    }
+}
+
+fn flush_deferred_systems_if_batch_closed(
+    messages: &mut Vec<Value>,
+    pending_tool_calls: &[Value],
+    pending_media: &[Value],
+    unanswered: &HashSet<String>,
+    deferred: &mut Vec<Value>,
+) {
+    if !tool_batch_open(pending_tool_calls, pending_media, unanswered) {
+        messages.append(deferred);
+    }
 }
 
 fn is_hoistable_system_message(msg: &Value) -> bool {
@@ -6694,20 +6804,24 @@ mod tests {
         assert_eq!(
             roles,
             vec![
-                "system",
                 "user",
                 "assistant",
                 "tool",
                 "tool",
                 "tool",
-                "user"
+                "user",
+                "system"
             ]
         );
-        assert_eq!(messages[2]["tool_calls"].as_array().unwrap().len(), 3);
-        assert_eq!(messages[3]["tool_call_id"], "call_0");
-        assert_eq!(messages[4]["tool_call_id"], "call_1");
-        assert_eq!(messages[5]["tool_call_id"], "call_2");
-        assert!(messages[0]["content"]
+        assert_eq!(messages[1]["tool_calls"].as_array().unwrap().len(), 3);
+        assert_eq!(messages[2]["tool_call_id"], "call_0");
+        assert_eq!(messages[3]["tool_call_id"], "call_1");
+        assert_eq!(messages[4]["tool_call_id"], "call_2");
+        assert!(!messages[0]["content"]
+            .as_str()
+            .unwrap_or("")
+            .contains("image_resize_notice"));
+        assert!(messages[6]["content"]
             .as_str()
             .unwrap()
             .contains("image_resize_notice"));
@@ -6732,10 +6846,14 @@ mod tests {
             .iter()
             .filter_map(|msg| msg.get("role").and_then(Value::as_str))
             .collect();
-        assert_eq!(roles, vec!["system", "user", "assistant", "tool"]);
-        assert_eq!(messages[2]["content"], "Checking the image.");
-        assert_eq!(messages[2]["tool_calls"].as_array().unwrap().len(), 1);
-        assert_eq!(messages[2]["tool_calls"][0]["id"], "call_0");
-        assert_eq!(messages[3]["tool_call_id"], "call_0");
+        assert_eq!(roles, vec!["user", "assistant", "tool", "system"]);
+        assert_eq!(messages[1]["content"], "Checking the image.");
+        assert_eq!(messages[1]["tool_calls"].as_array().unwrap().len(), 1);
+        assert_eq!(messages[1]["tool_calls"][0]["id"], "call_0");
+        assert_eq!(messages[2]["tool_call_id"], "call_0");
+        assert!(messages[3]["content"]
+            .as_str()
+            .unwrap()
+            .contains("image_resize_notice"));
     }
 }

@@ -1822,6 +1822,20 @@ impl RequestForwarder {
         // suffix and add the context-1m beta header.
         let mut codex_anthropic_one_m = false;
 
+        // 旁路标记要在压缩条目被改写之前从原始 Responses 正文读出来。
+        // 转成 Chat 或原样转发之后再写进发出去的 JSON。
+        let strata_park_hint = if matches!(app_type, AppType::Codex) {
+            let turn_metadata_header = headers
+                .get("x-codex-turn-metadata")
+                .and_then(|value| value.to_str().ok());
+            Some(super::providers::strata_park::hint(
+                &mapped_body,
+                turn_metadata_header,
+            ))
+        } else {
+            None
+        };
+
         // 转换请求体（如果需要）
         let mut request_body = if codex_responses_to_chat {
             let mut mapped_body = mapped_body;
@@ -1977,6 +1991,25 @@ impl RequestForwarder {
                     "[Codex] Rewrote compaction items for a native Responses upstream (provider={})",
                     provider.id
                 );
+            }
+        }
+
+        if let Some(hint) = strata_park_hint.as_ref() {
+            if super::providers::strata_park::apply(&base_url, &mut request_body, hint) {
+                log::info!(
+                    "[Strata] park hint ephemeral={} conversation={}",
+                    hint.ephemeral,
+                    hint.conversation.is_some()
+                );
+            }
+            if !hint.ephemeral {
+                if let Some(id) = hint.conversation.as_deref() {
+                    super::providers::strata_prefix::stabilize(
+                        &base_url,
+                        &mut request_body,
+                        id,
+                    );
+                }
             }
         }
 
